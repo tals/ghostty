@@ -58,6 +58,16 @@ animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// The minimum time between frame updates from wakeups, in nanoseconds,
+/// when the apprt asks for pacing (a headless surface has no display
+/// link). 0 renders on every wakeup.
+pace_ns: u64,
+pace_h: xev.Timer,
+pace_c: xev.Completion = .{},
+
+/// When the next paced frame is due, on the awake clock.
+pace_due: i96 = 0,
+
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
@@ -140,6 +150,10 @@ pub fn init(
     var draw_now = try xev.Async.init();
     errdefer draw_now.deinit();
 
+    // Frame pacing, see pace_ns
+    var pace_h = try xev.Timer.init();
+    errdefer pace_h.deinit();
+
     // Setup a timer for blinking the cursor
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
@@ -156,6 +170,8 @@ pub fn init(
         .stop = stop_h,
         .render_h = render_h,
         .draw_now = draw_now,
+        .pace_ns = if (@hasDecl(apprt.Surface, "frameInterval")) surface.frameInterval() else 0,
+        .pace_h = pace_h,
         .cursor_h = cursor_timer,
         .surface = surface,
         .renderer = renderer_impl,
@@ -179,6 +195,7 @@ pub fn deinit(self: *Thread) void {
     self.wakeup.deinit();
     self.render_h.deinit();
     self.draw_now.deinit();
+    self.pace_h.deinit();
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -489,8 +506,18 @@ fn wakeupCallback(
     t.drainMailbox() catch |err|
         log.err("error draining mailbox err={}", .{err});
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+    // Render immediately, or when the next paced frame is due
+    if (t.pace_ns == 0) {
+        _ = renderCallback(t, undefined, undefined, {});
+    } else if (t.pace_c.state() != .active) {
+        const now = std.Io.Timestamp.now(global.io(), .awake).nanoseconds;
+        if (now >= t.pace_due) {
+            t.renderPaced(now);
+        } else {
+            const ms = std.math.divCeil(i96, t.pace_due - now, std.time.ns_per_ms) catch 1;
+            t.pace_h.run(&t.loop, &t.pace_c, @intCast(ms), Thread, t, paceCallback);
+        }
+    }
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -514,6 +541,28 @@ fn wakeupCallback(
     // );
 
     return .rearm;
+}
+
+/// Render a paced frame. Keeps a steady cadence while wakeups keep
+/// coming and starts over after a quiet spell.
+fn renderPaced(self: *Thread, now: i96) void {
+    self.pace_due = if (now - self.pace_due < self.pace_ns)
+        self.pace_due + self.pace_ns
+    else
+        now + self.pace_ns;
+    _ = renderCallback(self, undefined, undefined, {});
+}
+
+fn paceCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch return .disarm;
+    const t = self_.?;
+    t.renderPaced(std.Io.Timestamp.now(global.io(), .awake).nanoseconds);
+    return .disarm;
 }
 
 fn drawNowCallback(

@@ -7,6 +7,7 @@ const gl = @import("opengl");
 const egl = gl.egl;
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
+const global = @import("../global.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -289,11 +290,14 @@ pub fn present(
         }
     }
 
+    const start = std.Io.Timestamp.now(global.io(), .awake);
+    const pixels = try target.readPixelsAlloc(self.alloc);
     return .{ .memory = .{
         .width = @intCast(target.width),
         .height = @intCast(target.height),
-        .pixels = try target.readPixelsAlloc(self.alloc),
+        .pixels = pixels,
         .alloc = self.alloc,
+        .readback_ns = @intCast(start.durationTo(.now(global.io(), .awake)).nanoseconds),
     } };
 }
 
@@ -309,6 +313,9 @@ pub const ExportedFrame = union(enum) {
         height: u32,
         pixels: []u8,
         alloc: Allocator,
+
+        /// Time spent reading the pixels back from the GPU.
+        readback_ns: u64 = 0,
 
         pub fn deinit(self: Memory) void {
             self.alloc.free(self.pixels);

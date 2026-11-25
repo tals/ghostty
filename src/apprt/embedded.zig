@@ -382,6 +382,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    headless: Headless,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -395,6 +396,13 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// No view: only with a renderer that exports frames (OpenGL), which
+    /// the embedder takes with ghostty_surface_take_frame.
+    pub const Headless = if (renderer.Renderer.ExportedFrame != void) struct {
+        /// Minimum time between frames in nanoseconds; 0 for none.
+        frame_interval_ns: u64,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -404,6 +412,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        headless: extern struct {
+            max_fps: f64,
         },
     };
 
@@ -424,6 +436,13 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .headless => if (Headless != void) .{ .headless = .{
+                .frame_interval_ns = if (c_platform.headless.max_fps > 0)
+                    @intFromFloat(std.time.ns_per_s / c_platform.headless.max_fps)
+                else
+                    0,
+            } } else error.UnsupportedPlatform,
         };
     }
 };
@@ -434,6 +453,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    headless = 3,
 };
 
 pub const EnvVar = extern struct {
@@ -623,6 +643,9 @@ pub const Surface = struct {
         );
         errdefer self.core_surface.deinit();
 
+        // Headless frames go to the embedder in CPU memory, not as DMABUFs.
+        if (self.platform == .headless) self.core_surface.reportPresentationHealth(.unhealthy);
+
         // If our options requested a specific font-size, set that.
         if (opts.font_size != 0) {
             var font_size = self.core_surface.font_size;
@@ -682,6 +705,15 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    /// The minimum time between frames for the renderer thread to keep,
+    /// in nanoseconds; 0 for none.
+    pub fn frameInterval(self: *const Surface) u64 {
+        return switch (self.platform) {
+            .headless => |v| if (Platform.Headless != void) v.frame_interval_ns else 0,
+            else => 0,
+        };
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1989,6 +2021,60 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// C type: ghostty_frame_s
+    pub const Frame = extern struct {
+        width: u32 = 0,
+        height: u32 = 0,
+        stride: usize = 0,
+        pixels: ?[*]const u8 = null,
+        readback_ns: u64 = 0,
+        handle: ?*anyopaque = null,
+    };
+
+    /// Take the latest frame a headless surface drew, if one is waiting.
+    export fn ghostty_surface_take_frame(surface: *Surface, out: *Frame) bool {
+        out.* = .{};
+        if (comptime renderer.Renderer.ExportedFrame == void) {
+            return false;
+        } else {
+            const frame = surface.core_surface.renderer.takeFrame() orelse return false;
+            const memory = switch (frame) {
+                .memory => |v| v,
+                // Drawn before the renderer learned the surface is headless.
+                else => {
+                    frame.deinit();
+                    return false;
+                },
+            };
+            const handle = global.alloc().create(renderer.Renderer.ExportedFrame) catch {
+                frame.deinit();
+                return false;
+            };
+            handle.* = frame;
+            out.* = .{
+                .width = memory.width,
+                .height = memory.height,
+                .stride = @as(usize, memory.width) * 4,
+                .pixels = memory.pixels.ptr,
+                .readback_ns = memory.readback_ns,
+                .handle = handle,
+            };
+            return true;
+        }
+    }
+
+    export fn ghostty_frame_free(out: *Frame) void {
+        if (comptime renderer.Renderer.ExportedFrame == void) {
+            return;
+        } else {
+            const ptr = out.handle orelse return;
+            const handle: *renderer.Renderer.ExportedFrame = @ptrCast(@alignCast(ptr));
+            handle.deinit();
+            global.alloc().destroy(handle);
+            out.* = .{};
+        }
     }
 
     /// Update the size of a surface. This will trigger resize notifications
