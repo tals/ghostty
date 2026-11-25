@@ -6,6 +6,7 @@
  *   bun corgi/build.ts                      every target this machine can build
  *   bun corgi/build.ts linux-x86_64         one target
  *   bun corgi/build.ts --publish            build, then upload to ghostty-host/VERSION/
+ *   bun corgi/build.ts --upload             upload what --publish built, after a failed upload
  *
  * macOS arm64 builds on a Mac (Xcode for the Metal shaders); Linux x86_64 and
  * arm64 cross-compile anywhere with Zig. VERSION is the tag on HEAD without
@@ -207,29 +208,42 @@ async function publish(version: string, files: string[]) {
   }
   if (!accessKeyId || !secretAccessKey) throw Error("no bucket credentials: see the comment at the top");
   const s3 = new Bun.S3Client({ endpoint: config.endpoint, region: config.region, bucket: config.bucket, accessKeyId, secretAccessKey });
-  for (const file of files) {
-    const key = `ghostty-host/${version}/${file.split("/").at(-1)}`;
+  const keys = files.map(file => [file, `ghostty-host/${version}/${file.split("/").at(-1)}`] as const);
+  for (const [file, key] of keys) {
     const bytes = readFileSync(file);
     const object = s3.file(key);
     // A published version never changes: the same bytes are skipped, others refused.
     if (await object.exists()) {
       if (sha256(new Uint8Array(await object.arrayBuffer())) !== sha256(bytes))
         throw Error(`${key} is already published with other contents; tag a new version`);
-      console.log(`    ${key} is already published`);
+      console.log(`    ${key} is already uploaded`);
       continue;
     }
     console.log(`    uploading ${key} (${(bytes.length / 1e6).toFixed(1)} MB)`);
     await object.write(bytes, { type: file.endsWith(".gz") ? "application/gzip" : "text/plain" });
-    const served = await fetch(`${config.publicBaseUrl}/${key}`, { cache: "no-store" });
-    if (!served.ok || sha256(new Uint8Array(await served.arrayBuffer())) !== sha256(bytes))
-      throw Error(`${config.publicBaseUrl}/${key} doesn't serve what was uploaded`);
+  }
+  // What a download gets: corgi.computer serves the bucket only on the paths
+  // routed to it (Corgi's site/bucket_routes.ts), and a new route takes a few
+  // seconds to reach the edge.
+  for (const [file, key] of keys) {
+    const url = `${config.publicBaseUrl}/${key}`;
+    for (let attempt = 1; ; attempt++) {
+      const served = await fetch(url, { cache: "no-store" });
+      if (served.ok && sha256(new Uint8Array(await served.arrayBuffer())) === sha256(readFileSync(file))) break;
+      if (attempt === 8)
+        throw Error(
+          `${url} answers HTTP ${served.status} without the upload; is ${new URL(url).host}/ghostty-host/* routed to the bucket?`,
+        );
+      await Bun.sleep(4000);
+    }
   }
   console.log(`published to ${config.publicBaseUrl}/ghostty-host/${version}/`);
 }
 
 const args = process.argv.slice(2);
 const publishing = args.includes("--publish");
-const asked = args.filter(a => a !== "--publish");
+const uploading = args.includes("--upload");
+const asked = args.filter(a => a !== "--publish" && a !== "--upload");
 for (const a of asked) if (!targets.includes(a as Target)) throw Error(`unknown target ${a}; one of ${targets.join(", ")}`);
 const chosen = (asked.length ? asked : targets).filter(t => t !== "macos-aarch64" || process.platform === "darwin") as Target[];
 const { name: v, tagged } = version();
@@ -237,6 +251,14 @@ if (publishing) {
   if (!tagged) throw Error("--publish needs a vX.Y.Z-corgi.N tag on HEAD");
   if (run(["git", "status", "--porcelain", "--untracked-files=no"])) throw Error("--publish needs a clean tree");
   if (chosen.length !== targets.length) throw Error(`--publish builds every target; this machine builds ${chosen.join(", ")}`);
+}
+if (uploading) {
+  if (!tagged) throw Error("--upload needs the vX.Y.Z-corgi.N tag on HEAD that --publish built");
+  const built = targets.map(target => join(out, `ghostty-host-${v}-${target}.tar.gz`));
+  const sums = join(out, "SHA256SUMS");
+  for (const file of [...built, sums]) if (!existsSync(file)) throw Error(`no ${file}; run --publish`);
+  await publish(v, [...built, sums]);
+  process.exit(0);
 }
 const compiler = zig();
 mkdirSync(out, { recursive: true });
