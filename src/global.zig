@@ -395,7 +395,7 @@ pub const GlobalState = struct {
     pub const Logging = packed struct {
         /// Whether to log to stderr. For lib mode we always disable stderr
         /// logging by default. Otherwise it's enabled by default.
-        stderr: bool = build_config.app_runtime != .none,
+        stderr: bool = build_config.app_runtime == .gtk,
         /// Whether to log to macOS's unified logging. Enabled by default
         /// on macOS.
         macos: bool = builtin.target.os.tag.isDarwin(),

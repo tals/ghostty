@@ -53,6 +53,11 @@ blending: configpkg.Config.AlphaBlending,
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
+/// A headless apprt has no view: its surface takes each frame in `present`
+/// and sets the size.
+rt_surface: if (headless) *apprt.Surface else void = if (headless) undefined else {},
+const headless = apprt.runtime == apprt.headless;
+
 pub fn init(
     alloc: Allocator,
     device: *const Device,
@@ -70,6 +75,14 @@ pub fn init(
     const queue = mtl_device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
     errdefer queue.release();
 
+    if (comptime headless) return .{
+        .layer = try IOSurfaceLayer.init(),
+        .device = device,
+        .queue = queue,
+        .blending = opts.config.blending,
+        .rt_surface = opts.rt_surface,
+    };
+
     const ViewInfo = struct {
         view: objc.Object,
         scaleFactor: f64,
@@ -82,7 +95,6 @@ pub fn init(
             .view = switch (opts.rt_surface.platform) {
                 .macos => |v| v.nsview,
                 .ios => |v| v.uiview,
-                .headless => unreachable, // OpenGL only
             },
         },
 
@@ -199,6 +211,11 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
+    if (comptime headless) return .{
+        .width = @min(self.rt_surface.size.width, self.device.max_texture_size),
+        .height = @min(self.rt_surface.size.height, self.device.max_texture_size),
+    };
+
     const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
     const scale = self.layer.layer.getProperty(f64, "contentsScale");
 
@@ -236,6 +253,7 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+    if (comptime headless) return self.rt_surface.presentIOSurface(target.surface);
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
     } else {

@@ -245,7 +245,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This is separate from `health` because a renderer
         /// can produce healthy frames that the apprt can't present.
-        presentation_health: std.atomic.Value(Health) = .{ .raw = .healthy },
+        /// The headless apprt takes frames in CPU memory from the first.
+        presentation_health: std.atomic.Value(Health) = .{
+            .raw = if (apprt.runtime == apprt.headless) .unhealthy else .healthy,
+        },
 
         /// True when we have a graphics context that can create GPU
         /// resources. Creating any GPU resource while this is false is invalid.

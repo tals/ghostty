@@ -11,6 +11,10 @@ pub const Runtime = enum {
     /// approach to building the application.
     gtk,
 
+    /// No window: ghostty-host, which serves one surface's frames and
+    /// input over HTTP for Corgi's captures.
+    headless,
+
     pub fn default(target: std.Target) Runtime {
         return switch (target.os.tag) {
             // The Linux and FreeBSD default is GTK because it is a full

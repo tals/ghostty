@@ -694,6 +694,7 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtk(step),
+            .headless => @import("GhosttyHost.zig").add(b, step),
         }
     }
 

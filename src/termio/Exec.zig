@@ -830,7 +830,7 @@ const Subprocess = struct {
         const args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
-            internal_os.passwd,
+            if (@hasDecl(apprt.runtime, "passwd")) apprt.runtime.passwd else internal_os.passwd,
         ) catch |err| switch (err) {
             // If we fail to allocate space for the command we want to
             // execute, we'd still like to try to run something so

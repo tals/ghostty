@@ -24,6 +24,8 @@ const MainReturn = switch (build_config.artifact) {
 };
 
 pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
+    if (comptime build_config.app_runtime == .headless) return apprt.headless.main(minimal);
+
     // We first start by initializing our global state. This will setup
     // process-level state we need to run the terminal. The reason we use
     // a global is because the C API needs to be able to access this state;
