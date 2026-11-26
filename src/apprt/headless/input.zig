@@ -492,49 +492,114 @@ pub fn opAction(ctx: ?*anyopaque) void {
     o.out.print("{{\"ok\":true,\"performed\":{},\"frame\":{d}}}", .{ performed, frames.drawnSeq() }) catch {};
 }
 
-/// The latest toast; an earlier one's timer leaves it up.
+/// The latest toast; an earlier one's animation leaves it alone.
 var toast_gen: usize = 0;
 
-/// {"text": "...", "ms": 2500}: shows text over the bottom row, right-aligned, for ms.
+/// {"text": "...", "strong": "...", "x": 120, "y": 40, "ms": 2500}: shows a
+/// pill with text, then strong in bold, for ms. It sits on the row above
+/// frame pixel (x, y), from a little left of it, such as where a click
+/// opened a link; without one, at the bottom right. It grows in and out.
 pub fn opToast(ctx: ?*anyopaque) void {
     const o: *Op = @ptrCast(@alignCast(ctx));
-    const text = str(o.body, "text") orelse return reply(o, 400, "text is required");
-    if (text.len == 0) return reply(o, 400, "text is required");
+    const text = str(o.body, "text") orelse "";
+    const strong = str(o.body, "strong") orelse "";
+    if (text.len == 0 and strong.len == 0) return reply(o, 400, "text or strong is required");
     const ms: u64 = @intFromFloat(std.math.clamp(num(o.body, "ms") orelse 2500, 0, 60_000));
-    banner(text) catch |err| {
+    const at: ?[2]f64 = if (num(o.body, "x")) |x| if (num(o.body, "y")) |y| .{ x, y } else null else null;
+    const width = banner(text, strong, at) catch |err| {
         log.err("error showing a toast err={}", .{err});
         return reply(o, 500, "could not show the toast");
     };
     toast_gen += 1;
-    if (std.Thread.spawn(.{}, clearToast, .{ toast_gen, ms })) |t| t.detach() else |_| {}
+    const animation: Animation = .{ .gen = toast_gen, .width = width, .ms = ms };
+    if (std.Thread.spawn(.{}, animate, .{animation})) |t| t.detach() else |_| show(toast_gen, width);
     reply(o, 200, null);
 }
 
-fn clearToast(gen: usize, ms: u64) void {
-    clock.sleepNs(ms * std.time.ns_per_ms);
-    loop.post(clearIfLatest, @ptrFromInt(gen));
+const Animation = struct { gen: usize, width: usize, ms: u64 };
+
+/// Grows the pill out from its left end, holds it, and shrinks it away.
+fn animate(a: Animation) void {
+    const steps = 8;
+    for (1..steps + 1) |i| {
+        clock.sleepNs(16 * std.time.ns_per_ms);
+        post(a.gen, eased(a.width, i, steps));
+    }
+    clock.sleepNs(a.ms * std.time.ns_per_ms);
+    for (1..steps) |i| {
+        clock.sleepNs(16 * std.time.ns_per_ms);
+        post(a.gen, eased(a.width, steps - i, steps));
+    }
+    clock.sleepNs(16 * std.time.ns_per_ms);
+    post(a.gen, 0);
 }
 
-fn clearIfLatest(ctx: ?*anyopaque) void {
-    if (@intFromPtr(ctx) == toast_gen) banner(null) catch {};
+/// How many of width cells show at step i of n: its two ends, then the
+/// rest, quickly at first.
+fn eased(width: usize, i: usize, n: usize) usize {
+    const k = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n));
+    const out = 1 - std.math.pow(f64, 1 - k, 3);
+    const rest: f64 = @floatFromInt(width -| 2);
+    return 2 + @as(usize, @intFromFloat(@round(rest * out)));
 }
 
-/// Sets the renderer's banner, shortened to fit the grid with an ellipsis, or clears it.
-fn banner(text: ?[]const u8) !void {
+// A step for the main thread: the toast's generation, and how many cells show.
+const shown_bits = 16;
+fn post(gen: usize, shown: usize) void {
+    loop.post(step, @ptrFromInt(gen << shown_bits | @min(shown, (1 << shown_bits) - 1)));
+}
+
+fn step(ctx: ?*anyopaque) void {
+    const v = @intFromPtr(ctx);
+    show(v >> shown_bits, v & ((1 << shown_bits) - 1));
+}
+
+/// Shows shown cells of the latest toast, or clears it at 0.
+fn show(gen: usize, shown: usize) void {
+    if (gen != toast_gen) return;
+    if (shown == 0) {
+        _ = banner(null, null, null) catch {};
+        return;
+    }
+    const surface = &main.surface.core_surface;
+    {
+        surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.renderer_state.mutex.unlock(global.io());
+        if (surface.renderer_state.banner) |*b| b.shown = shown;
+    }
+    surface.renderer_thread.wakeup.notify() catch {};
+}
+
+/// Sets the renderer's banner to text and then strong, shortened to fit the
+/// grid with an ellipsis, placed by at; or clears it. Returns its width,
+/// which shows none of it until a step does.
+fn banner(text: ?[]const u8, strong: ?[]const u8, at: ?[2]f64) !usize {
     const surface = &main.surface.core_surface;
     const Codepoint = renderer.State.Preedit.Codepoint;
     var codepoints: std.ArrayList(Codepoint) = .empty;
     defer codepoints.deinit(surface.alloc);
-    if (text) |t| {
-        // A cell of padding at each side and one from the edge.
-        const room = @as(usize, surface.size.grid().columns) -| 3;
+    var owned: ?renderer.State.Banner = null;
+    if (text != null or strong != null) {
+        const grid = surface.size.grid();
+        // The pill's ends and padding, and a cell from the edge.
+        const room = @as(usize, grid.columns) -| 5;
         var width: usize = 0;
-        var it = (try std.unicode.Utf8View.init(t)).iterator();
-        while (it.nextCodepoint()) |cp| {
-            const w: usize = @intCast(unicode.table.get(cp).width);
-            if (w == 0) continue;
-            try codepoints.append(surface.alloc, .{ .codepoint = cp, .wide = w > 1 });
-            width += w;
+        var bold: usize = 0;
+        for ([_][]const u8{ text orelse "", strong orelse "" }, 0..) |part, i| {
+            if (i == 1) {
+                if (part.len > 0 and codepoints.items.len > 0) {
+                    try codepoints.append(surface.alloc, .{ .codepoint = ' ' });
+                    width += 1;
+                }
+                bold = codepoints.items.len;
+            }
+            var it = (try std.unicode.Utf8View.init(part)).iterator();
+            while (it.nextCodepoint()) |cp| {
+                const w: usize = @intCast(unicode.table.get(cp).width);
+                if (w == 0) continue;
+                try codepoints.append(surface.alloc, .{ .codepoint = cp, .wide = w > 1 });
+                width += w;
+            }
         }
         if (width > room) {
             while (codepoints.items.len > 0 and width + 1 > room) {
@@ -542,16 +607,38 @@ fn banner(text: ?[]const u8) !void {
                 width -= if (last.wide) 2 else 1;
             }
             try codepoints.append(surface.alloc, .{ .codepoint = '…' });
+            width += 1;
         }
+        const total = width + 4;
+        const cols: usize = grid.columns;
+        const rows: usize = grid.rows;
+        var x: usize = cols -| (total + 1);
+        var y: usize = rows -| 1;
+        if (at) |p| {
+            const cell_w: f64 = @floatFromInt(@max(1, surface.size.cell.width));
+            const cell_h: f64 = @floatFromInt(@max(1, surface.size.cell.height));
+            const col: usize = @intFromFloat(std.math.clamp((p[0] - @as(f64, @floatFromInt(surface.size.padding.left))) / cell_w, 0, @as(f64, @floatFromInt(cols -| 1))));
+            const row: usize = @intFromFloat(std.math.clamp((p[1] - @as(f64, @floatFromInt(surface.size.padding.top))) / cell_h, 0, @as(f64, @floatFromInt(rows -| 1))));
+            // Above the click, where a link's own popover doesn't go; below on the top row.
+            y = if (row > 0) row - 1 else @min(row + 1, rows -| 1);
+            x = @min(col -| 2, cols -| total);
+        }
+        owned = .{
+            .text = .{ .codepoints = try codepoints.toOwnedSlice(surface.alloc) },
+            .strong = bold,
+            .x = @intCast(x),
+            .y = @intCast(y),
+            .shown = 0,
+        };
     }
-    const owned: ?renderer.State.Preedit = if (text != null) .{ .codepoints = try codepoints.toOwnedSlice(surface.alloc) } else null;
     {
         surface.renderer_state.mutex.lockUncancelable(global.io());
         defer surface.renderer_state.mutex.unlock(global.io());
-        if (surface.renderer_state.banner) |b| surface.alloc.free(b.codepoints);
+        if (surface.renderer_state.banner) |b| b.deinit(surface.alloc);
         surface.renderer_state.banner = owned;
     }
     surface.renderer_thread.wakeup.notify() catch {};
+    return if (owned) |b| b.width() else 0;
 }
 
 pub fn opQuit(ctx: ?*anyopaque) void {

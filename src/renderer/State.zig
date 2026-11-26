@@ -29,9 +29,9 @@ inspector: ?*Inspector = null,
 /// a future exercise.
 preedit: ?Preedit = null,
 
-/// Text the app runtime shows over the bottom row, right-aligned, such as a
-/// headless capture's notice that a link was opened. The runtime owns it.
-banner: ?Preedit = null,
+/// A notice the app runtime draws over the terminal, such as a headless
+/// capture's that a link was opened. The runtime owns it.
+banner: ?Banner = null,
 
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
@@ -121,6 +121,32 @@ pub const Mouse = struct {
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
+/// A pill on row y from column x: a rounded end and a space of padding at
+/// each side of its text, whose codepoints from `strong` on are bold. Only
+/// its first `shown` cells are drawn, so the runtime can grow it in and out.
+pub const Banner = struct {
+    text: Preedit = .{},
+    strong: usize = 0,
+    x: terminalpkg.size.CellCountInt = 0,
+    y: terminalpkg.size.CellCountInt = 0,
+    shown: usize = 0,
+
+    pub fn deinit(self: *const Banner, alloc: Allocator) void {
+        self.text.deinit(alloc);
+    }
+
+    pub fn clone(self: *const Banner, alloc: Allocator) !Banner {
+        var copy = self.*;
+        copy.text = try self.text.clone(alloc);
+        return copy;
+    }
+
+    /// Its width in cells, ends and padding included.
+    pub fn width(self: *const Banner) usize {
+        return self.text.width() + 4;
+    }
+};
+
 pub const Preedit = struct {
     /// The codepoints to render as preedit text.
     codepoints: []const Codepoint = &.{},
