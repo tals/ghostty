@@ -179,9 +179,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-        /// Whether the last frame showed the runtime's banner; one that comes or goes redraws every row.
-        banner_shown: bool = false,
-
         /// Set to true after the Kitty image placements are rebuilt. Like
         /// `cells_rebuilt`, this means the next frame must be drawn. This
         /// matters when the images change but no cell does, for example
@@ -288,6 +285,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
+
+        /// The generation of the app runtime's banner on the GPU; 0 for none.
+        banner_generation: u64 = 0,
 
         /// The base timestamp for the Kitty graphics animation clock.
         /// Animation frame timing is expressed as milliseconds since
@@ -1407,7 +1407,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                /// The runtime's banner, when it changed.
                 banner: ?renderer.State.Banner,
+                banner_changed: bool,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1511,7 +1513,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const p = state.preedit orelse break :preedit null;
                     break :preedit try p.clone(arena_alloc);
                 };
-                const banner: ?renderer.State.Banner = if (state.banner) |b| try b.clone(arena_alloc) else null;
+
+                // The runtime's banner, copied only when it's new.
+                const banner_generation: u64 = if (state.banner) |b| b.generation else 0;
+                const banner_changed = banner_generation != self.banner_generation;
+                const banner: ?renderer.State.Banner = if (!banner_changed) null else if (state.banner) |b| copy: {
+                    var copy = b;
+                    copy.pixels = try arena_alloc.dupe(u8, b.pixels);
+                    break :copy copy;
+                } else null;
 
                 // Rebuild our Kitty image placements when the placements
                 // or the images changed. The render state update above
@@ -1565,6 +1575,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .banner = banner,
+                    .banner_changed = banner_changed,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1659,7 +1670,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
-                    critical.banner,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
@@ -1710,6 +1720,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 ) catch |err| {
                     log.warn("error updating overlay images err={}", .{err});
                 };
+
+                if (critical.banner_changed) {
+                    self.images.bannerUpdate(
+                        self.alloc,
+                        critical.banner,
+                        .{ self.size.cell.width, self.size.cell.height },
+                    ) catch |err| {
+                        log.warn("error updating the banner image err={}", .{err});
+                    };
+                    self.banner_generation = if (critical.banner) |b| b.generation else 0;
+                }
 
                 // Update custom shader uniforms that depend on terminal state.
                 self.updateCustomShaderUniformsFromState();
@@ -2016,6 +2037,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .overlay,
+                );
+
+                // The app runtime's banner, over everything.
+                if (self.banner_generation != 0) self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
+                    &pass,
+                    .banner,
                 );
             }
 
@@ -2640,7 +2669,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
-            banner: ?renderer.State.Banner,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
@@ -2661,8 +2689,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = state.dirty == .full or grid_size_diff or banner != null or self.banner_shown;
-            self.banner_shown = banner != null;
+            const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2730,37 +2757,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
-            // The banner's cells that show, within the grid.
-            const banner_range: ?PreeditRange = if (banner) |b| banner: {
-                if (b.y >= state.rows or b.x >= state.cols) break :banner null;
-                const shown = @min(b.shown, b.width(), state.cols - b.x);
-                if (shown < 2) break :banner null;
-                break :banner .{
-                    .y = b.y,
-                    .x = .{ b.x, @intCast(b.x + shown - 1) },
-                    .cp_offset = 0,
-                };
-            } else null;
-            // The cells it covers, and a blank one at each side of it.
-            const banner_clear: ?PreeditRange = if (banner_range) |r| .{
-                .y = r.y,
-                .x = .{ r.x[0] -| 1, @min(r.x[1] + 1, state.cols - 1) },
-                .cp_offset = 0,
-            } else null;
-            // Its tail's cell, once the callout has grown past it, and the
-            // cells either side.
-            const banner_tail: ?renderer.State.Banner.Tail = if (banner) |b| tail: {
-                const r = banner_range orelse break :tail null;
-                const t = b.tail orelse break :tail null;
-                if (t.y >= state.rows or t.x <= r.x[0] or t.x >= r.x[1]) break :tail null;
-                break :tail t;
-            } else null;
-            const tail_clear: ?PreeditRange = if (banner_tail) |t| .{
-                .y = t.y,
-                .x = .{ t.x -| 1, @min(t.x + 1, state.cols - 1) },
-                .cp_offset = 0,
-            } else null;
-
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2786,13 +2782,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     y,
                     row,
                     cells,
-                    // The row under the banner leaves its cells to the banner.
-                    if (banner_clear != null and banner_clear.?.y == y)
-                        banner_clear
-                    else if (tail_clear != null and tail_clear.?.y == y)
-                        tail_clear
-                    else
-                        preedit_range,
+                    preedit_range,
                     selection,
                     highlights,
                     links,
@@ -2944,7 +2934,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our preedit text.
             if (preedit) |preedit_v| preedit: {
                 const range = preedit_range orelse break :preedit;
-                if (banner_range != null and banner_range.?.y == range.y) break :preedit;
                 var x = range.x[0];
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
                     self.addPreeditCell(
@@ -2960,57 +2949,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     x += if (cp.wide) 2 else 1;
-                }
-            }
-
-            // The banner: a callout whose ends, tail and logo are sprites
-            // Ghostty draws, light on a dark terminal and dark on a light one.
-            // While it grows in or out, its text shows as far as its right end
-            // has come.
-            if (banner) |b| banner: {
-                const range = banner_range orelse break :banner;
-                const RGB = terminal.color.RGB;
-                const bg = state.colors.background;
-                const dark = @as(u32, bg.r) * 299 + @as(u32, bg.g) * 587 + @as(u32, bg.b) * 114 < 128_000;
-                const body: RGB, const soft: RGB, const strong: RGB = if (dark)
-                    .{ .{ .r = 0xff, .g = 0xff, .b = 0xff }, .{ .r = 0x5f, .g = 0x63, .b = 0x68 }, .{ .r = 0x1a, .g = 0x73, .b = 0xe8 } }
-                else
-                    .{ .{ .r = 0x30, .g = 0x31, .b = 0x34 }, .{ .r = 0xbd, .g = 0xc1, .b = 0xc6 }, .{ .r = 0x8a, .g = 0xb4, .b = 0xf8 } };
-                const left, const right = range.x;
-                for (left + 1..right) |x| self.cells.bgCell(range.y, x).* = .{ body.r, body.g, body.b, 255 };
-                self.addBannerSprite(.callout_left, left, range.y, body, 1) catch {};
-                self.addBannerSprite(.callout_right, right, range.y, body, 1) catch {};
-                if (banner_tail) |t|
-                    self.addBannerSprite(if (t.down) .callout_tail_down else .callout_tail_up, t.x, t.y, body, 1) catch {};
-                var x: usize = left + 2;
-                if (b.icon == .chrome and x + 2 <= right) {
-                    const layers = [_]struct { font.Sprite, RGB }{
-                        .{ .chrome_red, .{ .r = 0xea, .g = 0x43, .b = 0x35 } },
-                        .{ .chrome_yellow, .{ .r = 0xfb, .g = 0xbc, .b = 0x04 } },
-                        .{ .chrome_green, .{ .r = 0x34, .g = 0xa8, .b = 0x53 } },
-                        .{ .chrome_blue, .{ .r = 0x1a, .g = 0x73, .b = 0xe8 } },
-                    };
-                    for (layers) |layer| self.addBannerSprite(layer[0], @intCast(x), range.y, layer[1], 2) catch {};
-                }
-                if (b.icon != .none) x += 3;
-                for (b.text.codepoints, 0..) |cp, i| {
-                    const width: u2 = if (cp.wide) 2 else 1;
-                    if (x + width > right) break;
-                    // An icon before a space takes both cells, as in the terminal.
-                    const next_blank = i + 1 < b.text.codepoints.len and b.text.codepoints[i + 1].codepoint == ' ';
-                    const room: u2 = if (width == 1 and next_blank and cellpkg.isSymbol(cp.codepoint)) 2 else width;
-                    const bold = i >= b.strong;
-                    self.addBannerCell(
-                        cp.codepoint,
-                        @intCast(x),
-                        range.y,
-                        if (bold) strong else soft,
-                        if (bold) .bold else .regular,
-                        room,
-                    ) catch |err| {
-                        log.warn("error building banner cell x={} err={}", .{ x, err });
-                    };
-                    x += width;
                 }
             }
 
@@ -3770,72 +3708,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
             }
-        }
-
-        /// Adds one of the banner's sprites at (x, y), `width` cells wide.
-        fn addBannerSprite(
-            self: *Self,
-            sprite: font.Sprite,
-            x: terminal.size.CellCountInt,
-            y: terminal.size.CellCountInt,
-            color: terminal.color.RGB,
-            width: u2,
-        ) !void {
-            const render = try self.font_grid.renderGlyph(self.alloc, font.sprite_index, @backingInt(sprite), .{
-                .cell_width = width,
-                .grid_metrics = self.grid_metrics,
-            });
-            if (render.glyph.width == 0 or render.glyph.height == 0) return;
-            try self.cells.add(self.alloc, .text, .{
-                .atlas = .grayscale,
-                .bools = .{ .no_min_contrast = true },
-                .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, 255 },
-                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
-                .glyph_size = .{ render.glyph.width, render.glyph.height },
-                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
-            });
-        }
-
-        /// Adds one of the banner's glyphs at (x, y), fit to `width` cells as
-        /// the terminal's own would be.
-        fn addBannerCell(
-            self: *Self,
-            cp: u21,
-            x: terminal.size.CellCountInt,
-            y: terminal.size.CellCountInt,
-            color: terminal.color.RGB,
-            style: font.Style,
-            width: u2,
-        ) !void {
-            const opts: font.Glyph.RenderOptions = .{
-                .grid_metrics = self.grid_metrics,
-                .thicken = self.config.font_thicken,
-                .thicken_strength = self.config.font_thicken_strength,
-                .cell_width = width,
-                .constraint = getConstraint(cp) orelse if (cellpkg.isSymbol(cp)) .{ .size = .fit } else .none,
-                .constraint_width = width,
-            };
-            const index = try self.font_grid.getIndex(self.alloc, cp, style, null) orelse return;
-            // Ghostty draws sprites, such as Powerline's, itself: their glyph is the codepoint.
-            const render = if (index.special() != null)
-                try self.font_grid.renderGlyph(self.alloc, index, cp, opts)
-            else
-                try self.font_grid.renderCodepoint(self.alloc, cp, style, null, opts) orelse return;
-            if (render.glyph.width == 0 or render.glyph.height == 0) return;
-            try self.cells.add(self.alloc, .text, .{
-                .atlas = switch (render.presentation) {
-                    .emoji => .color,
-                    .text => .grayscale,
-                },
-                // The pill's colors stay as they are.
-                .bools = .{ .no_min_contrast = true },
-                .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, 255 },
-                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
-                .glyph_size = .{ render.glyph.width, render.glyph.height },
-                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
-            });
         }
 
         /// Sync the atlas data to the given texture. This copies the bytes

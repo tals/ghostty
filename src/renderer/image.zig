@@ -9,6 +9,7 @@ const Renderer = @import("../renderer.zig").Renderer;
 const GraphicsAPI = Renderer.API;
 const Texture = GraphicsAPI.Texture;
 const Overlay = @import("Overlay.zig");
+const renderer = @import("../renderer.zig");
 
 const log = std.log.scoped(.renderer_image);
 
@@ -47,6 +48,9 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
+    /// The app runtime's banner, drawn above everything else.
+    banner_placements: std.ArrayListUnmanaged(Placement),
+
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
@@ -55,6 +59,7 @@ pub const State = struct {
         .kitty_placements_generation = 0,
         .kitty_storage_generation = 0,
         .overlay_placements = .empty,
+        .banner_placements = .empty,
     };
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -65,6 +70,7 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
+        self.banner_placements.deinit(alloc);
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -107,6 +113,7 @@ pub const State = struct {
         kitty_below_text,
         kitty_above_text,
         overlay,
+        banner,
     };
 
     /// Draw the given named set of placements.
@@ -125,6 +132,7 @@ pub const State = struct {
             .kitty_below_text => self.kitty_placements.items[self.kitty_bg_end..self.kitty_text_end],
             .kitty_above_text => self.kitty_placements.items[self.kitty_text_end..],
             .overlay => self.overlay_placements.items,
+            .banner => self.banner_placements.items,
         };
 
         for (placements) |p| {
@@ -242,6 +250,46 @@ pub const State = struct {
         });
     }
 
+    /// Update the app runtime's banner: a new picture, or none. Its pixels
+    /// are copied.
+    pub fn bannerUpdate(
+        self: *State,
+        alloc: Allocator,
+        banner_: ?renderer.State.Banner,
+        cell: [2]u32,
+    ) !void {
+        self.banner_placements.clearRetainingCapacity();
+        const banner = banner_ orelse {
+            if (self.images.getPtr(.banner)) |data| data.image.markForUnload();
+            return;
+        };
+        try self.banner_placements.ensureUnusedCapacity(alloc, 1);
+        const pending: Image.Pending = .{
+            .width = banner.width,
+            .height = banner.height,
+            .pixel_format = .rgba,
+            .data = @constCast(banner.pixels.ptr),
+        };
+        try self.prepImage(alloc, .banner, banner.generation, pending);
+        errdefer comptime unreachable;
+        // Placements sit on a cell, offset within it.
+        self.banner_placements.appendAssumeCapacity(.{
+            .image_id = .banner,
+            .layer = .above_text,
+            .x = @intCast(banner.x / cell[0]),
+            .y = @intCast(banner.y / cell[1]),
+            .z = 0,
+            .width = banner.width,
+            .height = banner.height,
+            .cell_offset_x = banner.x % cell[0],
+            .cell_offset_y = banner.y % cell[1],
+            .source_x = 0,
+            .source_y = 0,
+            .source_width = banner.width,
+            .source_height = banner.height,
+        });
+    }
+
     /// Returns true if `kittyUpdate` must run, because the placements or
     /// the images changed since it last ran. `render_state` must have
     /// just been updated from `t`.
@@ -310,7 +358,7 @@ pub const State = struct {
                         kv.value_ptr.image.markForUnload();
                     },
 
-                    .overlay => {},
+                    .overlay, .banner => {},
                 }
             }
         }
@@ -532,6 +580,9 @@ pub const Id = union(enum) {
     /// image for now. In the future we can support layers here if we want.
     overlay,
 
+    /// The app runtime's banner (renderer.State.banner).
+    banner,
+
     /// Z-ordering tie-breaker for images with the same z value.
     pub fn zLessThan(lhs: Id, rhs: Id) bool {
         // If our tags aren't the same, we sort by tag.
@@ -540,7 +591,7 @@ pub const Id = union(enum) {
                 // Kitty images always sort before (lower z) non-kitty images.
                 .kitty => true,
 
-                .overlay => false,
+                .overlay, .banner => false,
             };
         }
 
@@ -551,7 +602,7 @@ pub const Id = union(enum) {
             },
 
             // No sensical ordering
-            .overlay => return false,
+            .overlay, .banner => return false,
         }
     }
 };

@@ -4,9 +4,9 @@ const std = @import("std");
 const global = @import("../../global.zig");
 const input = @import("../../input.zig");
 const renderer = @import("../../renderer.zig");
-const unicode = @import("../../unicode/main.zig");
 const clock = @import("clock.zig");
 const frames = @import("frames.zig");
+const callout = @import("callout.zig");
 const loop = @import("loop.zig");
 const main = @import("main.zig");
 
@@ -494,174 +494,108 @@ pub fn opAction(ctx: ?*anyopaque) void {
 
 /// The latest toast; an earlier one's animation leaves it alone.
 var toast_gen: usize = 0;
+/// The latest toast's callout at full strength, which each step fades.
+var toast_picture: ?callout.Picture = null;
+/// Each picture the renderer gets is a new generation.
+var picture_gen: u64 = 0;
 
 /// {"icon": "chrome", "text": "...", "strong": "...", "x": 120, "y": 40,
 /// "ms": 2500}: shows a callout with the icon, text, then strong in bold,
 /// for ms. It points at frame pixel (x, y), such as where a click opened a
-/// link, from two rows above it, or below near the top; without one it sits
-/// at the bottom right. It grows in and out.
+/// link, from above it, or below near the top; without one it sits at the
+/// bottom right. It fades in and out.
 pub fn opToast(ctx: ?*anyopaque) void {
     const o: *Op = @ptrCast(@alignCast(ctx));
     const text = str(o.body, "text") orelse "";
     const strong = str(o.body, "strong") orelse "";
     if (text.len == 0 and strong.len == 0) return reply(o, 400, "text or strong is required");
-    const icon: renderer.State.Banner.Icon = if (str(o.body, "icon")) |name|
-        std.meta.stringToEnum(renderer.State.Banner.Icon, name) orelse return reply(o, 400, "icon is chrome or none")
+    const icon: callout.Icon = if (str(o.body, "icon")) |name|
+        std.meta.stringToEnum(callout.Icon, name) orelse return reply(o, 400, "icon is chrome or none")
     else
         .none;
     const ms: u64 = @intFromFloat(std.math.clamp(num(o.body, "ms") orelse 2500, 0, 60_000));
-    const at: ?[2]f64 = if (num(o.body, "x")) |x| if (num(o.body, "y")) |y| .{ x, y } else null else null;
-    const width = banner(.{ .icon = icon, .text = text, .strong = strong, .at = at }) catch |err| {
-        log.err("error showing a toast err={}", .{err});
-        return reply(o, 500, "could not show the toast");
+    const surface = &main.surface.core_surface;
+    const size = surface.size;
+    const grid = size.grid();
+    // What it points at, from the grid's top left: the click and its row.
+    const at: ?callout.At = if (num(o.body, "x")) |x| if (num(o.body, "y")) |y| at: {
+        const cell_h: f64 = @floatFromInt(@max(1, size.cell.height));
+        const gy = y - @as(f64, @floatFromInt(size.padding.top));
+        const row = std.math.clamp(@floor(gy / cell_h), 0, @as(f64, @floatFromInt(grid.rows -| 1)));
+        break :at .{ .x = x - @as(f64, @floatFromInt(size.padding.left)), .top = row * cell_h, .bottom = (row + 1) * cell_h };
+    } else null else null;
+    const background = background: {
+        surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.renderer_state.mutex.unlock(global.io());
+        const black: @TypeOf(surface.renderer_state.terminal.colors.background.get().?) = .{ .r = 0, .g = 0, .b = 0 };
+        break :background surface.renderer_state.terminal.colors.background.get() orelse black;
     };
+    const picture = callout.draw(surface.alloc, .{ .icon = icon, .text = text, .strong = strong, .at = at }, .{
+        .width = @as(u32, grid.columns) * size.cell.width,
+        .height = @as(u32, grid.rows) * size.cell.height,
+        .cell_width = size.cell.width,
+        .font_size = surface.font_size,
+        .dark = @as(u32, background.r) * 299 + @as(u32, background.g) * 587 + @as(u32, background.b) * 114 < 128_000,
+    }) catch |err| {
+        log.err("error drawing a toast err={}", .{err});
+        return reply(o, 500, "could not draw the toast");
+    };
+    if (toast_picture) |p| p.deinit(surface.alloc);
+    toast_picture = picture;
     toast_gen += 1;
-    const animation: Animation = .{ .gen = toast_gen, .width = width, .ms = ms };
-    if (std.Thread.spawn(.{}, animate, .{animation})) |t| t.detach() else |_| show(toast_gen, width);
+    if (std.Thread.spawn(.{}, animate, .{ toast_gen, ms })) |t| t.detach() else |_| show(toast_gen, fade_steps);
     reply(o, 200, null);
 }
 
-const Animation = struct { gen: usize, width: usize, ms: u64 };
+/// Frames to fade in, and out.
+const fade_steps = 9;
 
-/// Grows the pill out from its left end, holds it, and shrinks it away.
-fn animate(a: Animation) void {
-    const steps = 8;
-    for (1..steps + 1) |i| {
-        clock.sleepNs(16 * std.time.ns_per_ms);
-        post(a.gen, eased(a.width, i, steps));
+/// Fades the callout in as it moves a little toward where it points from,
+/// holds it, and fades it out.
+fn animate(gen: usize, ms: u64) void {
+    for (1..2 * fade_steps + 2) |k| {
+        clock.sleepNs(if (k == fade_steps + 1) ms * std.time.ns_per_ms else 16 * std.time.ns_per_ms);
+        loop.post(step, @ptrFromInt(gen << 16 | k));
     }
-    clock.sleepNs(a.ms * std.time.ns_per_ms);
-    for (1..steps) |i| {
-        clock.sleepNs(16 * std.time.ns_per_ms);
-        post(a.gen, eased(a.width, steps - i, steps));
-    }
-    clock.sleepNs(16 * std.time.ns_per_ms);
-    post(a.gen, 0);
-}
-
-/// How many of width cells show at step i of n: its two ends, then the
-/// rest, quickly at first.
-fn eased(width: usize, i: usize, n: usize) usize {
-    const k = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n));
-    const out = 1 - std.math.pow(f64, 1 - k, 3);
-    const rest: f64 = @floatFromInt(width -| 2);
-    return 2 + @as(usize, @intFromFloat(@round(rest * out)));
-}
-
-// A step for the main thread: the toast's generation, and how many cells show.
-const shown_bits = 16;
-fn post(gen: usize, shown: usize) void {
-    loop.post(step, @ptrFromInt(gen << shown_bits | @min(shown, (1 << shown_bits) - 1)));
 }
 
 fn step(ctx: ?*anyopaque) void {
     const v = @intFromPtr(ctx);
-    show(v >> shown_bits, v & ((1 << shown_bits) - 1));
+    show(v >> 16, v & 0xffff);
 }
 
-/// Shows shown cells of the latest toast, or clears it at 0.
-fn show(gen: usize, shown: usize) void {
+/// Shows step k of the latest toast: fading in up to fade_steps, out after,
+/// and gone past 2 × fade_steps.
+fn show(gen: usize, k: usize) void {
     if (gen != toast_gen) return;
-    if (shown == 0) {
-        _ = banner(null) catch {};
-        return;
-    }
     const surface = &main.surface.core_surface;
-    {
-        surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer surface.renderer_state.mutex.unlock(global.io());
-        if (surface.renderer_state.banner) |*b| b.shown = shown;
-    }
-    surface.renderer_thread.wakeup.notify() catch {};
-}
-
-const Toast = struct {
-    icon: renderer.State.Banner.Icon,
-    text: []const u8,
-    strong: []const u8,
-    at: ?[2]f64,
-};
-
-/// Sets the renderer's banner to a toast's text and then strong, shortened
-/// to fit the grid with an ellipsis, placed by at; or clears it. Returns its
-/// width, which shows none of it until a step does.
-fn banner(toast_: ?Toast) !usize {
-    const surface = &main.surface.core_surface;
-    const Codepoint = renderer.State.Preedit.Codepoint;
-    var codepoints: std.ArrayList(Codepoint) = .empty;
-    defer codepoints.deinit(surface.alloc);
-    var owned: ?renderer.State.Banner = null;
-    if (toast_) |toast| {
-        const grid = surface.size.grid();
-        // The callout's ends, padding and icon, and a cell from the edge.
-        const room = @as(usize, grid.columns) -| 5 -| @as(usize, if (toast.icon == .none) 0 else 3);
-        var width: usize = 0;
-        var bold: usize = 0;
-        for ([_][]const u8{ toast.text, toast.strong }, 0..) |part, i| {
-            if (i == 1) {
-                if (part.len > 0 and codepoints.items.len > 0) {
-                    try codepoints.append(surface.alloc, .{ .codepoint = ' ' });
-                    width += 1;
-                }
-                bold = codepoints.items.len;
-            }
-            var it = (try std.unicode.Utf8View.init(part)).iterator();
-            while (it.nextCodepoint()) |cp| {
-                const w: usize = @intCast(unicode.table.get(cp).width);
-                if (w == 0) continue;
-                try codepoints.append(surface.alloc, .{ .codepoint = cp, .wide = w > 1 });
-                width += w;
-            }
-        }
-        if (width > room) {
-            while (codepoints.items.len > 0 and width + 1 > room) {
-                const last = codepoints.pop().?;
-                width -= if (last.wide) 2 else 1;
-            }
-            try codepoints.append(surface.alloc, .{ .codepoint = '…' });
-            width += 1;
-        }
-        const total = width + 4 + @as(usize, if (toast.icon == .none) 0 else 3);
-        const cols: usize = grid.columns;
-        const rows: usize = grid.rows;
-        var x: usize = cols -| (total + 1);
-        var y: usize = rows -| 1;
-        var tail: ?renderer.State.Banner.Tail = null;
-        if (toast.at) |p| {
-            const cell_w: f64 = @floatFromInt(@max(1, surface.size.cell.width));
-            const cell_h: f64 = @floatFromInt(@max(1, surface.size.cell.height));
-            const col: usize = @intFromFloat(std.math.clamp((p[0] - @as(f64, @floatFromInt(surface.size.padding.left))) / cell_w, 0, @as(f64, @floatFromInt(cols -| 1))));
-            const row: usize = @intFromFloat(std.math.clamp((p[1] - @as(f64, @floatFromInt(surface.size.padding.top))) / cell_h, 0, @as(f64, @floatFromInt(rows -| 1))));
-            // Above the click, where a link's own popover doesn't go, with
-            // the tail between; below near the top.
-            const down = row >= 2;
-            y = if (down) row - 2 else @min(row + 2, rows -| 1);
-            x = @min(col -| 3, cols -| total);
-            // The tail leaves the callout's straight edge, between its ends.
-            tail = .{
-                .x = @intCast(std.math.clamp(col, x + 1, x + total -| 2)),
-                .y = @intCast(if (down) row - 1 else @min(row + 1, rows -| 1)),
-                .down = down,
-            };
-        }
-        owned = .{
-            .text = .{ .codepoints = try codepoints.toOwnedSlice(surface.alloc) },
-            .strong = bold,
-            .icon = toast.icon,
-            .x = @intCast(x),
-            .y = @intCast(y),
-            .shown = 0,
-            .tail = tail,
+    const full = toast_picture orelse return;
+    var banner: ?renderer.State.Banner = null;
+    if (k <= 2 * fade_steps) {
+        const t = @as(f64, @floatFromInt(@min(k, 2 * fade_steps - k))) / fade_steps;
+        const eased = 1 - std.math.pow(f64, 1 - @min(t, 1), 3);
+        const alpha = if (k <= fade_steps) eased else t;
+        const pixels = surface.alloc.dupe(u8, full.pixels) catch return;
+        var i: usize = 3;
+        while (i < pixels.len) : (i += 4) pixels[i] = @intFromFloat(@round(@as(f64, @floatFromInt(pixels[i])) * alpha));
+        const slide: i64 = if (k < fade_steps) @intFromFloat(@round(6 * (1 - eased))) else 0;
+        picture_gen += 1;
+        banner = .{
+            .pixels = pixels,
+            .width = full.width,
+            .height = full.height,
+            .x = full.x,
+            .y = @intCast(@max(0, @as(i64, full.y) + slide * full.rise)),
+            .generation = picture_gen,
         };
     }
     {
         surface.renderer_state.mutex.lockUncancelable(global.io());
         defer surface.renderer_state.mutex.unlock(global.io());
-        if (surface.renderer_state.banner) |b| b.deinit(surface.alloc);
-        surface.renderer_state.banner = owned;
+        if (surface.renderer_state.banner) |b| surface.alloc.free(b.pixels);
+        surface.renderer_state.banner = banner;
     }
     surface.renderer_thread.wakeup.notify() catch {};
-    return if (owned) |b| b.width() else 0;
 }
 
 pub fn opQuit(ctx: ?*anyopaque) void {

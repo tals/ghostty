@@ -29,8 +29,8 @@ inspector: ?*Inspector = null,
 /// a future exercise.
 preedit: ?Preedit = null,
 
-/// A notice the app runtime draws over the terminal, such as a headless
-/// capture's that a link was opened. The runtime owns it.
+/// A picture the app runtime lays over the terminal, such as a headless
+/// capture's callout for a link it opened. The runtime owns it.
 banner: ?Banner = null,
 
 /// Mouse state. This only contains state relevant to what renderers
@@ -121,43 +121,15 @@ pub const Mouse = struct {
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
-/// A callout on row y from column x: a round-cornered end and a space of
-/// padding at each side of a logo and its text, whose codepoints from
-/// `strong` on are bold, and a tail in the row below or above, pointing at
-/// what it's about. Only its first `shown` cells are drawn, so the runtime
-/// can grow it in and out.
+/// RGBA pixels, not premultiplied, whose top left is (x, y) pixels from
+/// the grid's. A different picture takes a different generation.
 pub const Banner = struct {
-    text: Preedit = .{},
-    strong: usize = 0,
-    icon: Icon = .none,
-    x: terminalpkg.size.CellCountInt = 0,
-    y: terminalpkg.size.CellCountInt = 0,
-    shown: usize = 0,
-    tail: ?Tail = null,
-
-    /// A logo before the text, two cells wide and a space from it.
-    pub const Icon = enum { none, chrome };
-
-    pub const Tail = struct {
-        x: terminalpkg.size.CellCountInt,
-        y: terminalpkg.size.CellCountInt,
-        down: bool,
-    };
-
-    pub fn deinit(self: *const Banner, alloc: Allocator) void {
-        self.text.deinit(alloc);
-    }
-
-    pub fn clone(self: *const Banner, alloc: Allocator) !Banner {
-        var copy = self.*;
-        copy.text = try self.text.clone(alloc);
-        return copy;
-    }
-
-    /// Its width in cells, ends and padding included.
-    pub fn width(self: *const Banner) usize {
-        return self.text.width() + 4 + @as(usize, if (self.icon == .none) 0 else 3);
-    }
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    generation: u64,
 };
 
 pub const Preedit = struct {
