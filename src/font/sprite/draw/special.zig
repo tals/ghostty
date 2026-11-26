@@ -9,6 +9,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const font = @import("../../main.zig");
 const Sprite = font.sprite.Sprite;
+const callout = @import("callout.zig");
+
+pub const callout_left = callout.left;
+pub const callout_right = callout.right;
+pub const callout_tail_down = callout.tail_down;
+pub const callout_tail_up = callout.tail_up;
+pub const chrome_red = callout.chrome_red;
+pub const chrome_yellow = callout.chrome_yellow;
+pub const chrome_green = callout.chrome_green;
+pub const chrome_blue = callout.chrome_blue;
 
 pub fn underline(
     cp: u32,

@@ -121,15 +121,28 @@ pub const Mouse = struct {
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
-/// A pill on row y from column x: a rounded end and a space of padding at
-/// each side of its text, whose codepoints from `strong` on are bold. Only
-/// its first `shown` cells are drawn, so the runtime can grow it in and out.
+/// A callout on row y from column x: a round-cornered end and a space of
+/// padding at each side of a logo and its text, whose codepoints from
+/// `strong` on are bold, and a tail in the row below or above, pointing at
+/// what it's about. Only its first `shown` cells are drawn, so the runtime
+/// can grow it in and out.
 pub const Banner = struct {
     text: Preedit = .{},
     strong: usize = 0,
+    icon: Icon = .none,
     x: terminalpkg.size.CellCountInt = 0,
     y: terminalpkg.size.CellCountInt = 0,
     shown: usize = 0,
+    tail: ?Tail = null,
+
+    /// A logo before the text, two cells wide and a space from it.
+    pub const Icon = enum { none, chrome };
+
+    pub const Tail = struct {
+        x: terminalpkg.size.CellCountInt,
+        y: terminalpkg.size.CellCountInt,
+        down: bool,
+    };
 
     pub fn deinit(self: *const Banner, alloc: Allocator) void {
         self.text.deinit(alloc);
@@ -143,7 +156,7 @@ pub const Banner = struct {
 
     /// Its width in cells, ends and padding included.
     pub fn width(self: *const Banner) usize {
-        return self.text.width() + 4;
+        return self.text.width() + 4 + @as(usize, if (self.icon == .none) 0 else 3);
     }
 };
 

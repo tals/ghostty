@@ -495,18 +495,23 @@ pub fn opAction(ctx: ?*anyopaque) void {
 /// The latest toast; an earlier one's animation leaves it alone.
 var toast_gen: usize = 0;
 
-/// {"text": "...", "strong": "...", "x": 120, "y": 40, "ms": 2500}: shows a
-/// pill with text, then strong in bold, for ms. It sits on the row above
-/// frame pixel (x, y), from a little left of it, such as where a click
-/// opened a link; without one, at the bottom right. It grows in and out.
+/// {"icon": "chrome", "text": "...", "strong": "...", "x": 120, "y": 40,
+/// "ms": 2500}: shows a callout with the icon, text, then strong in bold,
+/// for ms. It points at frame pixel (x, y), such as where a click opened a
+/// link, from two rows above it, or below near the top; without one it sits
+/// at the bottom right. It grows in and out.
 pub fn opToast(ctx: ?*anyopaque) void {
     const o: *Op = @ptrCast(@alignCast(ctx));
     const text = str(o.body, "text") orelse "";
     const strong = str(o.body, "strong") orelse "";
     if (text.len == 0 and strong.len == 0) return reply(o, 400, "text or strong is required");
+    const icon: renderer.State.Banner.Icon = if (str(o.body, "icon")) |name|
+        std.meta.stringToEnum(renderer.State.Banner.Icon, name) orelse return reply(o, 400, "icon is chrome or none")
+    else
+        .none;
     const ms: u64 = @intFromFloat(std.math.clamp(num(o.body, "ms") orelse 2500, 0, 60_000));
     const at: ?[2]f64 = if (num(o.body, "x")) |x| if (num(o.body, "y")) |y| .{ x, y } else null else null;
-    const width = banner(text, strong, at) catch |err| {
+    const width = banner(.{ .icon = icon, .text = text, .strong = strong, .at = at }) catch |err| {
         log.err("error showing a toast err={}", .{err});
         return reply(o, 500, "could not show the toast");
     };
@@ -558,7 +563,7 @@ fn step(ctx: ?*anyopaque) void {
 fn show(gen: usize, shown: usize) void {
     if (gen != toast_gen) return;
     if (shown == 0) {
-        _ = banner(null, null, null) catch {};
+        _ = banner(null) catch {};
         return;
     }
     const surface = &main.surface.core_surface;
@@ -570,22 +575,29 @@ fn show(gen: usize, shown: usize) void {
     surface.renderer_thread.wakeup.notify() catch {};
 }
 
-/// Sets the renderer's banner to text and then strong, shortened to fit the
-/// grid with an ellipsis, placed by at; or clears it. Returns its width,
-/// which shows none of it until a step does.
-fn banner(text: ?[]const u8, strong: ?[]const u8, at: ?[2]f64) !usize {
+const Toast = struct {
+    icon: renderer.State.Banner.Icon,
+    text: []const u8,
+    strong: []const u8,
+    at: ?[2]f64,
+};
+
+/// Sets the renderer's banner to a toast's text and then strong, shortened
+/// to fit the grid with an ellipsis, placed by at; or clears it. Returns its
+/// width, which shows none of it until a step does.
+fn banner(toast_: ?Toast) !usize {
     const surface = &main.surface.core_surface;
     const Codepoint = renderer.State.Preedit.Codepoint;
     var codepoints: std.ArrayList(Codepoint) = .empty;
     defer codepoints.deinit(surface.alloc);
     var owned: ?renderer.State.Banner = null;
-    if (text != null or strong != null) {
+    if (toast_) |toast| {
         const grid = surface.size.grid();
-        // The pill's ends and padding, and a cell from the edge.
-        const room = @as(usize, grid.columns) -| 5;
+        // The callout's ends, padding and icon, and a cell from the edge.
+        const room = @as(usize, grid.columns) -| 5 -| @as(usize, if (toast.icon == .none) 0 else 3);
         var width: usize = 0;
         var bold: usize = 0;
-        for ([_][]const u8{ text orelse "", strong orelse "" }, 0..) |part, i| {
+        for ([_][]const u8{ toast.text, toast.strong }, 0..) |part, i| {
             if (i == 1) {
                 if (part.len > 0 and codepoints.items.len > 0) {
                     try codepoints.append(surface.alloc, .{ .codepoint = ' ' });
@@ -609,26 +621,37 @@ fn banner(text: ?[]const u8, strong: ?[]const u8, at: ?[2]f64) !usize {
             try codepoints.append(surface.alloc, .{ .codepoint = '…' });
             width += 1;
         }
-        const total = width + 4;
+        const total = width + 4 + @as(usize, if (toast.icon == .none) 0 else 3);
         const cols: usize = grid.columns;
         const rows: usize = grid.rows;
         var x: usize = cols -| (total + 1);
         var y: usize = rows -| 1;
-        if (at) |p| {
+        var tail: ?renderer.State.Banner.Tail = null;
+        if (toast.at) |p| {
             const cell_w: f64 = @floatFromInt(@max(1, surface.size.cell.width));
             const cell_h: f64 = @floatFromInt(@max(1, surface.size.cell.height));
             const col: usize = @intFromFloat(std.math.clamp((p[0] - @as(f64, @floatFromInt(surface.size.padding.left))) / cell_w, 0, @as(f64, @floatFromInt(cols -| 1))));
             const row: usize = @intFromFloat(std.math.clamp((p[1] - @as(f64, @floatFromInt(surface.size.padding.top))) / cell_h, 0, @as(f64, @floatFromInt(rows -| 1))));
-            // Above the click, where a link's own popover doesn't go; below on the top row.
-            y = if (row > 0) row - 1 else @min(row + 1, rows -| 1);
-            x = @min(col -| 2, cols -| total);
+            // Above the click, where a link's own popover doesn't go, with
+            // the tail between; below near the top.
+            const down = row >= 2;
+            y = if (down) row - 2 else @min(row + 2, rows -| 1);
+            x = @min(col -| 3, cols -| total);
+            // The tail leaves the callout's straight edge, between its ends.
+            tail = .{
+                .x = @intCast(std.math.clamp(col, x + 1, x + total -| 2)),
+                .y = @intCast(if (down) row - 1 else @min(row + 1, rows -| 1)),
+                .down = down,
+            };
         }
         owned = .{
             .text = .{ .codepoints = try codepoints.toOwnedSlice(surface.alloc) },
             .strong = bold,
+            .icon = toast.icon,
             .x = @intCast(x),
             .y = @intCast(y),
             .shown = 0,
+            .tail = tail,
         };
     }
     {

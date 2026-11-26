@@ -109,7 +109,7 @@ drawn after it. Errors: `{"ok":false,"error":"..."}` with 400, 404, 405 or
 | `POST /mouse` | `{"action":"move\|press\|release\|click\|scroll\|leave","x","y","button","count","mods","dx","dy","precise"}`, or an array of them (a drag). `dy` > 0 scrolls up. `mods` press and release their keys around each event; hold one across a glide with `/key` `press`. |
 | `POST /focus` | `{"focused":false}` |
 | `POST /action` | `{"action":"..."}` runs a Ghostty keybind action |
-| `POST /toast` | `{"text":"Opened","strong":"corgi.computer/docs","x":520,"y":546,"ms":2500}` shows a blue pill with rounded ends and `text`, then `strong` in bold, for `ms` (default 2500), shortened with "…" to fit. It sits on the row above frame pixel `x`,`y` (below it on the top row), or at the bottom right without one, and grows in and out. Corgi's captures show what a click opened this way. |
+| `POST /toast` | `{"icon":"chrome","text":"Opened in Chrome:","strong":"corgi.computer/docs","x":520,"y":546,"ms":2500}` shows a callout with round corners for `ms` (default 2500): the icon's logo (`chrome`, or none), `text`, then `strong` in bold, shortened with "…" to fit. It sits two rows above frame pixel `x`,`y` with a tail pointing at it (below it near the top), or at the bottom right without one, and grows in and out. It's white on a dark terminal and dark on a light one. Corgi's captures show what a click opened this way. |
 | `POST /quit` | stops the host |
 
 `input_us` in `/status` gives, for mouse ops and for the other input ops,

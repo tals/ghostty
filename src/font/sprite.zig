@@ -34,6 +34,16 @@ pub const Sprite = enum(u32) {
     cursor_bar,
     cursor_underline,
 
+    // The headless app runtime's callouts, from draw/callout.zig.
+    callout_left,
+    callout_right,
+    callout_tail_down,
+    callout_tail_up,
+    chrome_red,
+    chrome_yellow,
+    chrome_green,
+    chrome_blue,
+
     test {
         const testing = std.testing;
         try testing.expectEqual(start, @backingInt(Sprite.underline));

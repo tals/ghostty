@@ -2747,6 +2747,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .x = .{ r.x[0] -| 1, @min(r.x[1] + 1, state.cols - 1) },
                 .cp_offset = 0,
             } else null;
+            // Its tail's cell, once the callout has grown past it, and the
+            // cells either side.
+            const banner_tail: ?renderer.State.Banner.Tail = if (banner) |b| tail: {
+                const r = banner_range orelse break :tail null;
+                const t = b.tail orelse break :tail null;
+                if (t.y >= state.rows or t.x <= r.x[0] or t.x >= r.x[1]) break :tail null;
+                break :tail t;
+            } else null;
+            const tail_clear: ?PreeditRange = if (banner_tail) |t| .{
+                .y = t.y,
+                .x = .{ t.x -| 1, @min(t.x + 1, state.cols - 1) },
+                .cp_offset = 0,
+            } else null;
 
             for (
                 0..,
@@ -2774,7 +2787,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     row,
                     cells,
                     // The row under the banner leaves its cells to the banner.
-                    if (banner_clear != null and banner_clear.?.y == y) banner_clear else preedit_range,
+                    if (banner_clear != null and banner_clear.?.y == y)
+                        banner_clear
+                    else if (tail_clear != null and tail_clear.?.y == y)
+                        tail_clear
+                    else
+                        preedit_range,
                     selection,
                     highlights,
                     links,
@@ -2945,19 +2963,36 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // The banner: a blue pill whose rounded ends are Powerline's,
-            // which Ghostty draws itself. While it grows in or out, its text
-            // shows as far as its right end has come.
+            // The banner: a callout whose ends, tail and logo are sprites
+            // Ghostty draws, light on a dark terminal and dark on a light one.
+            // While it grows in or out, its text shows as far as its right end
+            // has come.
             if (banner) |b| banner: {
                 const range = banner_range orelse break :banner;
-                const pill: terminal.color.RGB = .{ .r = 0x2f, .g = 0x6f, .b = 0xeb };
-                const soft: terminal.color.RGB = .{ .r = 0xd4, .g = 0xe2, .b = 0xff };
-                const strong: terminal.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+                const RGB = terminal.color.RGB;
+                const bg = state.colors.background;
+                const dark = @as(u32, bg.r) * 299 + @as(u32, bg.g) * 587 + @as(u32, bg.b) * 114 < 128_000;
+                const body: RGB, const soft: RGB, const strong: RGB = if (dark)
+                    .{ .{ .r = 0xff, .g = 0xff, .b = 0xff }, .{ .r = 0x5f, .g = 0x63, .b = 0x68 }, .{ .r = 0x1a, .g = 0x73, .b = 0xe8 } }
+                else
+                    .{ .{ .r = 0x30, .g = 0x31, .b = 0x34 }, .{ .r = 0xbd, .g = 0xc1, .b = 0xc6 }, .{ .r = 0x8a, .g = 0xb4, .b = 0xf8 } };
                 const left, const right = range.x;
-                for (left + 1..right) |x| self.cells.bgCell(range.y, x).* = .{ pill.r, pill.g, pill.b, 255 };
-                self.addBannerCell(0xE0B6, left, range.y, pill, .regular, 1) catch {};
-                self.addBannerCell(0xE0B4, right, range.y, pill, .regular, 1) catch {};
+                for (left + 1..right) |x| self.cells.bgCell(range.y, x).* = .{ body.r, body.g, body.b, 255 };
+                self.addBannerSprite(.callout_left, left, range.y, body, 1) catch {};
+                self.addBannerSprite(.callout_right, right, range.y, body, 1) catch {};
+                if (banner_tail) |t|
+                    self.addBannerSprite(if (t.down) .callout_tail_down else .callout_tail_up, t.x, t.y, body, 1) catch {};
                 var x: usize = left + 2;
+                if (b.icon == .chrome and x + 2 <= right) {
+                    const layers = [_]struct { font.Sprite, RGB }{
+                        .{ .chrome_red, .{ .r = 0xea, .g = 0x43, .b = 0x35 } },
+                        .{ .chrome_yellow, .{ .r = 0xfb, .g = 0xbc, .b = 0x04 } },
+                        .{ .chrome_green, .{ .r = 0x34, .g = 0xa8, .b = 0x53 } },
+                        .{ .chrome_blue, .{ .r = 0x1a, .g = 0x73, .b = 0xe8 } },
+                    };
+                    for (layers) |layer| self.addBannerSprite(layer[0], @intCast(x), range.y, layer[1], 2) catch {};
+                }
+                if (b.icon != .none) x += 3;
                 for (b.text.codepoints, 0..) |cp, i| {
                     const width: u2 = if (cp.wide) 2 else 1;
                     if (x + width > right) break;
@@ -3735,6 +3770,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
             }
+        }
+
+        /// Adds one of the banner's sprites at (x, y), `width` cells wide.
+        fn addBannerSprite(
+            self: *Self,
+            sprite: font.Sprite,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+            color: terminal.color.RGB,
+            width: u2,
+        ) !void {
+            const render = try self.font_grid.renderGlyph(self.alloc, font.sprite_index, @backingInt(sprite), .{
+                .cell_width = width,
+                .grid_metrics = self.grid_metrics,
+            });
+            if (render.glyph.width == 0 or render.glyph.height == 0) return;
+            try self.cells.add(self.alloc, .text, .{
+                .atlas = .grayscale,
+                .bools = .{ .no_min_contrast = true },
+                .grid_pos = .{ @intCast(x), @intCast(y) },
+                .color = .{ color.r, color.g, color.b, 255 },
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
+                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
+            });
         }
 
         /// Adds one of the banner's glyphs at (x, y), fit to `width` cells as
