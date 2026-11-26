@@ -3,6 +3,9 @@
 const std = @import("std");
 const global = @import("../../global.zig");
 const input = @import("../../input.zig");
+const renderer = @import("../../renderer.zig");
+const unicode = @import("../../unicode/main.zig");
+const clock = @import("clock.zig");
 const frames = @import("frames.zig");
 const loop = @import("loop.zig");
 const main = @import("main.zig");
@@ -487,6 +490,68 @@ pub fn opAction(ctx: ?*anyopaque) void {
     publishState();
     o.status = 200;
     o.out.print("{{\"ok\":true,\"performed\":{},\"frame\":{d}}}", .{ performed, frames.drawnSeq() }) catch {};
+}
+
+/// The latest toast; an earlier one's timer leaves it up.
+var toast_gen: usize = 0;
+
+/// {"text": "...", "ms": 2500}: shows text over the bottom row, right-aligned, for ms.
+pub fn opToast(ctx: ?*anyopaque) void {
+    const o: *Op = @ptrCast(@alignCast(ctx));
+    const text = str(o.body, "text") orelse return reply(o, 400, "text is required");
+    if (text.len == 0) return reply(o, 400, "text is required");
+    const ms: u64 = @intFromFloat(std.math.clamp(num(o.body, "ms") orelse 2500, 0, 60_000));
+    banner(text) catch |err| {
+        log.err("error showing a toast err={}", .{err});
+        return reply(o, 500, "could not show the toast");
+    };
+    toast_gen += 1;
+    if (std.Thread.spawn(.{}, clearToast, .{ toast_gen, ms })) |t| t.detach() else |_| {}
+    reply(o, 200, null);
+}
+
+fn clearToast(gen: usize, ms: u64) void {
+    clock.sleepNs(ms * std.time.ns_per_ms);
+    loop.post(clearIfLatest, @ptrFromInt(gen));
+}
+
+fn clearIfLatest(ctx: ?*anyopaque) void {
+    if (@intFromPtr(ctx) == toast_gen) banner(null) catch {};
+}
+
+/// Sets the renderer's banner, shortened to fit the grid with an ellipsis, or clears it.
+fn banner(text: ?[]const u8) !void {
+    const surface = &main.surface.core_surface;
+    const Codepoint = renderer.State.Preedit.Codepoint;
+    var codepoints: std.ArrayList(Codepoint) = .empty;
+    defer codepoints.deinit(surface.alloc);
+    if (text) |t| {
+        // A cell of padding at each side and one from the edge.
+        const room = @as(usize, surface.size.grid().columns) -| 3;
+        var width: usize = 0;
+        var it = (try std.unicode.Utf8View.init(t)).iterator();
+        while (it.nextCodepoint()) |cp| {
+            const w: usize = @intCast(unicode.table.get(cp).width);
+            if (w == 0) continue;
+            try codepoints.append(surface.alloc, .{ .codepoint = cp, .wide = w > 1 });
+            width += w;
+        }
+        if (width > room) {
+            while (codepoints.items.len > 0 and width + 1 > room) {
+                const last = codepoints.pop().?;
+                width -= if (last.wide) 2 else 1;
+            }
+            try codepoints.append(surface.alloc, .{ .codepoint = '…' });
+        }
+    }
+    const owned: ?renderer.State.Preedit = if (text != null) .{ .codepoints = try codepoints.toOwnedSlice(surface.alloc) } else null;
+    {
+        surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.renderer_state.mutex.unlock(global.io());
+        if (surface.renderer_state.banner) |b| surface.alloc.free(b.codepoints);
+        surface.renderer_state.banner = owned;
+    }
+    surface.renderer_thread.wakeup.notify() catch {};
 }
 
 pub fn opQuit(ctx: ?*anyopaque) void {

@@ -29,6 +29,10 @@ inspector: ?*Inspector = null,
 /// a future exercise.
 preedit: ?Preedit = null,
 
+/// Text the app runtime shows over the bottom row, right-aligned, such as a
+/// headless capture's notice that a link was opened. The runtime owns it.
+banner: ?Preedit = null,
+
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
 mouse: Mouse = .{},

@@ -152,7 +152,9 @@ pub fn png(alloc: Allocator, rgba: []const u8, width: u32, height: u32) ![]u8 {
         for (1..row) |i| cur[i] -%= prev[i];
     }
 
-    var compressed: std.Io.Writer.Allocating = .init(alloc);
+    // Deflate needs room to write into from the start; terminal frames
+    // compress to a small share of their raw size.
+    var compressed: std.Io.Writer.Allocating = try .initCapacity(alloc, raw.len / 8 + 4096);
     defer compressed.deinit();
     {
         const window = try alloc.alloc(u8, std.compress.flate.max_window_len);

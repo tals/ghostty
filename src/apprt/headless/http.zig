@@ -304,6 +304,7 @@ const post_routes = std.StaticStringMap(*const fn (?*anyopaque) void).initCompti
     .{ "/mouse", &input.opMouse },
     .{ "/focus", &input.opFocus },
     .{ "/action", &input.opAction },
+    .{ "/toast", &input.opToast },
     .{ "/quit", &input.opQuit },
 });
 

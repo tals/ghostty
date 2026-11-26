@@ -179,6 +179,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// Whether the last frame showed the runtime's banner; one that comes or goes redraws every row.
+        banner_shown: bool = false,
+
         /// Set to true after the Kitty image placements are rebuilt. Like
         /// `cells_rebuilt`, this means the next frame must be drawn. This
         /// matters when the images change but no cell does, for example
@@ -1404,6 +1407,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                banner: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1507,6 +1511,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const p = state.preedit orelse break :preedit null;
                     break :preedit try p.clone(arena_alloc);
                 };
+                const banner: ?renderer.State.Preedit = if (state.banner) |b| try b.clone(arena_alloc) else null;
 
                 // Rebuild our Kitty image placements when the placements
                 // or the images changed. The render state update above
@@ -1559,6 +1564,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
+                    .banner = banner,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1653,6 +1659,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
+                    critical.banner,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
@@ -2633,6 +2640,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
+            banner: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
@@ -2653,7 +2661,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = state.dirty == .full or grid_size_diff;
+            const rebuild = state.dirty == .full or grid_size_diff or banner != null or self.banner_shown;
+            self.banner_shown = banner != null;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2721,6 +2730,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // The banner sits on the bottom row, right-aligned, with a cell of
+            // padding at each side and one between it and the edge.
+            const banner_range: ?PreeditRange = if (banner) |b| banner: {
+                if (state.rows == 0 or state.cols < 4) break :banner null;
+                const fit = b.range(0, state.cols - 4);
+                const end = state.cols - 2;
+                break :banner .{
+                    .y = @intCast(state.rows - 1),
+                    .x = .{ end - (fit.end - fit.start + 2), end },
+                    .cp_offset = fit.cp_offset,
+                };
+            } else null;
+
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2746,7 +2768,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     y,
                     row,
                     cells,
-                    preedit_range,
+                    // The row under the banner leaves its cells to the banner.
+                    if (banner_range != null and banner_range.?.y == y) banner_range else preedit_range,
                     selection,
                     highlights,
                     links,
@@ -2898,12 +2921,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our preedit text.
             if (preedit) |preedit_v| preedit: {
                 const range = preedit_range orelse break :preedit;
+                if (banner_range != null and banner_range.?.y == range.y) break :preedit;
                 var x = range.x[0];
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
                     self.addPreeditCell(
                         cp,
                         .{ .x = x, .y = range.y },
                         state.colors.foreground,
+                        true,
                     ) catch |err| {
                         log.warn("error building preedit cell, will be invalid x={} y={}, err={}", .{
                             x,
@@ -2912,6 +2937,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         });
                     };
 
+                    x += if (cp.wide) 2 else 1;
+                }
+            }
+
+            // The banner, in the terminal's colors swapped.
+            if (banner) |b| banner: {
+                const range = banner_range orelse break :banner;
+                const fg = state.colors.background;
+                const bg = state.colors.foreground;
+                for (range.x[0]..range.x[1] + 1) |x| self.cells.bgCell(range.y, x).* = .{ bg.r, bg.g, bg.b, 255 };
+                var x = range.x[0] + 1;
+                for (b.codepoints[range.cp_offset..]) |cp| {
+                    self.addPreeditCell(cp, .{ .x = x, .y = range.y }, fg, false) catch |err| {
+                        log.warn("error building banner cell x={} err={}", .{ x, err });
+                    };
                     x += if (cp.wide) 2 else 1;
                 }
             }
@@ -3633,6 +3673,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp: renderer.State.Preedit.Codepoint,
             coord: terminal.Coordinate,
             screen_fg: terminal.color.RGB,
+            underline: bool,
         ) !void {
             // Render the glyph for our preedit text
             const render_ = self.font_grid.renderCodepoint(
@@ -3668,6 +3709,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
 
             // Add underline
+            if (!underline) return;
             try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
